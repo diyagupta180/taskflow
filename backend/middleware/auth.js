@@ -12,10 +12,9 @@ function authenticate(req, res, next) {
   try {
     const payload = jwt.verify(token, JWT_SECRET);
     const db = getDB();
-    const result = db.exec(`SELECT id, name, email, role FROM users WHERE id = ?`, [payload.userId]);
-    if (!result[0]?.values?.length) return res.status(401).json({ error: 'User not found' });
-    const [id, name, email, role] = result[0].values[0];
-    req.user = { id, name, email, role };
+    const user = db.users.find(u => u.id === payload.userId);
+    if (!user) return res.status(401).json({ error: 'User not found' });
+    req.user = { id: user.id, name: user.name, email: user.email, role: user.role };
     next();
   } catch (e) {
     return res.status(401).json({ error: 'Invalid token' });
@@ -34,14 +33,11 @@ function requireProjectAccess(req, res, next) {
   const projectId = req.params.projectId || req.body.project_id || req.params.id;
   if (!projectId) return next();
   if (req.user.role === 'admin') return next();
-  const result = db.exec(
-    `SELECT role FROM project_members WHERE project_id = ? AND user_id = ?`,
-    [projectId, req.user.id]
-  );
-  if (!result[0]?.values?.length) {
+  const member = db.project_members.find(m => m.project_id === projectId && m.user_id === req.user.id);
+  if (!member) {
     return res.status(403).json({ error: 'Not a member of this project' });
   }
-  req.projectRole = result[0].values[0][0];
+  req.projectRole = member.role;
   next();
 }
 

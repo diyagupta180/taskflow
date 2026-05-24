@@ -6,88 +6,78 @@ const { authenticate, requireProjectAccess } = require('../middleware/auth');
 
 const router = express.Router();
 
-function rowsToObjects(result) {
-  if (!result[0]) return [];
-  const cols = result[0].columns;
-  return result[0].values.map(row =>
-    Object.fromEntries(cols.map((c, i) => [c, row[i]]))
-  );
-}
-
 router.get('/', authenticate, (req, res) => {
   const db = getDB();
-  let result;
+  let projects;
   if (req.user.role === 'admin') {
-    result = db.exec(`SELECT p.*, u.name as owner_name,
-      (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id) as task_count,
-      (SELECT COUNT(*) FROM project_members pm WHERE pm.project_id = p.id) as member_count
-      FROM projects p JOIN users u ON p.owner_id = u.id ORDER BY p.created_at DESC`);
+    projects = db.projects;
   } else {
-    result = db.exec(`SELECT p.*, u.name as owner_name,
-      (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id) as task_count,
-      (SELECT COUNT(*) FROM project_members pm2 WHERE pm2.project_id = p.id) as member_count,
-      pm.role as my_role
-      FROM projects p JOIN users u ON p.owner_id = u.id
-      JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = ?
-      ORDER BY p.created_at DESC`, [req.user.id]);
+    const myProjectIds = db.project_members.filter(m => m.user_id === req.user.id).map(m => m.project_id);
+    projects = db.projects.filter(p => myProjectIds.includes(p.id));
   }
-  res.json(rowsToObjects(result));
+  const result = projects.map(p => {
+    const owner = db.users.find(u => u.id === p.owner_id);
+    const task_count = db.tasks.filter(t => t.project_id === p.id).length;
+    const member_count = db.project_members.filter(m => m.project_id === p.id).length;
+    return { ...p, owner_name: owner?.name, task_count, member_count };
+  });
+  res.json(result);
 });
 
 router.post('/', authenticate, [
-  body('name').trim().notEmpty().withMessage('Project name required'),
+  body('name').trim().notEmpty(),
 ], (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
   const { name, description } = req.body;
   const db = getDB();
   const id = uuidv4();
-  db.run(`INSERT INTO projects (id, name, description, owner_id) VALUES (?, ?, ?, ?)`,
-    [id, name, description || '', req.user.id]);
-  db.run(`INSERT INTO project_members (project_id, user_id, role) VALUES (?, ?, 'admin')`,
-    [id, req.user.id]);
-  saveDB();
-  const result = db.exec(`SELECT p.*, u.name as owner_name FROM projects p JOIN users u ON p.owner_id = u.id WHERE p.id = ?`, [id]);
-  res.status(201).json(rowsToObjects(result)[0]);
+  const project = { id, name, description: description || '', owner_id: req.user.id, status: 'active', created_at: new Date().toISOString() };
+  db.projects.push(project);
+  db.project_members.push({ project_id: id, user_id: req.user.id, role: 'admin', joined_at: new Date().toISOString() });
+  const owner = db.users.find(u => u.id === req.user.id);
+  res.status(201).json({ ...project, owner_name: owner?.name });
 });
 
 router.get('/:id', authenticate, requireProjectAccess, (req, res) => {
   const db = getDB();
-  const result = db.exec(`SELECT p.*, u.name as owner_name FROM projects p
-    JOIN users u ON p.owner_id = u.id WHERE p.id = ?`, [req.params.id]);
-  if (!result[0]?.values?.length) return res.status(404).json({ error: 'Project not found' });
-  res.json(rowsToObjects(result)[0]);
+  const project = db.projects.find(p => p.id === req.params.id);
+  if (!project) return res.status(404).json({ error: 'Project not found' });
+  const owner = db.users.find(u => u.id === project.owner_id);
+  res.json({ ...project, owner_name: owner?.name });
 });
 
 router.put('/:id', authenticate, requireProjectAccess, (req, res) => {
   const db = getDB();
+  const idx = db.projects.findIndex(p => p.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: 'Not found' });
   const { name, description, status } = req.body;
-  db.run(`UPDATE projects SET name = COALESCE(?, name), description = COALESCE(?, description), status = COALESCE(?, status) WHERE id = ?`,
-    [name, description, status, req.params.id]);
-  saveDB();
+  if (name) db.projects[idx].name = name;
+  if (description) db.projects[idx].description = description;
+  if (status) db.projects[idx].status = status;
   res.json({ message: 'Updated' });
 });
 
 router.delete('/:id', authenticate, (req, res) => {
   const db = getDB();
-  const proj = db.exec(`SELECT owner_id FROM projects WHERE id = ?`, [req.params.id]);
-  if (!proj[0]?.values?.length) return res.status(404).json({ error: 'Project not found' });
-  const ownerId = proj[0].values[0][0];
-  if (req.user.role !== 'admin' && ownerId !== req.user.id) {
-    return res.status(403).json({ error: 'Only owner or admin can delete' });
+  const idx = db.projects.findIndex(p => p.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: 'Not found' });
+  if (req.user.role !== 'admin' && db.projects[idx].owner_id !== req.user.id) {
+    return res.status(403).json({ error: 'Not authorized' });
   }
-  db.run(`DELETE FROM tasks WHERE project_id = ?`, [req.params.id]);
-  db.run(`DELETE FROM project_members WHERE project_id = ?`, [req.params.id]);
-  db.run(`DELETE FROM projects WHERE id = ?`, [req.params.id]);
-  saveDB();
+  db.projects.splice(idx, 1);
+  db.tasks = db.tasks.filter(t => t.project_id !== req.params.id);
+  db.project_members = db.project_members.filter(m => m.project_id !== req.params.id);
   res.json({ message: 'Deleted' });
 });
 
 router.get('/:id/members', authenticate, requireProjectAccess, (req, res) => {
   const db = getDB();
-  const result = db.exec(`SELECT u.id, u.name, u.email, u.role as system_role, pm.role as project_role, pm.joined_at
-    FROM project_members pm JOIN users u ON pm.user_id = u.id WHERE pm.project_id = ?`, [req.params.id]);
-  res.json(rowsToObjects(result));
+  const members = db.project_members.filter(m => m.project_id === req.params.id).map(m => {
+    const user = db.users.find(u => u.id === m.user_id);
+    return { ...m, name: user?.name, email: user?.email, system_role: user?.role, project_role: m.role };
+  });
+  res.json(members);
 });
 
 router.post('/:id/members', authenticate, requireProjectAccess, (req, res) => {
@@ -96,23 +86,17 @@ router.post('/:id/members', authenticate, requireProjectAccess, (req, res) => {
   }
   const { email, role = 'member' } = req.body;
   const db = getDB();
-  const userResult = db.exec(`SELECT id FROM users WHERE email = ?`, [email]);
-  if (!userResult[0]?.values?.length) return res.status(404).json({ error: 'User not found' });
-  const userId = userResult[0].values[0][0];
-  const existing = db.exec(`SELECT 1 FROM project_members WHERE project_id = ? AND user_id = ?`,
-    [req.params.id, userId]);
-  if (existing[0]?.values?.length) return res.status(409).json({ error: 'Already a member' });
-  db.run(`INSERT INTO project_members (project_id, user_id, role) VALUES (?, ?, ?)`,
-    [req.params.id, userId, role]);
-  saveDB();
+  const user = db.users.find(u => u.email === email);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  const exists = db.project_members.find(m => m.project_id === req.params.id && m.user_id === user.id);
+  if (exists) return res.status(409).json({ error: 'Already a member' });
+  db.project_members.push({ project_id: req.params.id, user_id: user.id, role, joined_at: new Date().toISOString() });
   res.status(201).json({ message: 'Member added' });
 });
 
 router.delete('/:id/members/:userId', authenticate, requireProjectAccess, (req, res) => {
   const db = getDB();
-  db.run(`DELETE FROM project_members WHERE project_id = ? AND user_id = ?`,
-    [req.params.id, req.params.userId]);
-  saveDB();
+  db.project_members = db.project_members.filter(m => !(m.project_id === req.params.id && m.user_id === req.params.userId));
   res.json({ message: 'Removed' });
 });
 

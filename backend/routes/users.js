@@ -4,32 +4,19 @@ const { authenticate, requireAdmin } = require('../middleware/auth');
 
 const router = express.Router();
 
-function rowsToObjects(result) {
-  if (!result[0]) return [];
-  const cols = result[0].columns;
-  return result[0].values.map(row =>
-    Object.fromEntries(cols.map((c, i) => [c, row[i]]))
-  );
-}
-
 router.get('/', authenticate, (req, res) => {
   const db = getDB();
-  const result = db.exec(`SELECT id, name, email, role, created_at FROM users ORDER BY created_at DESC`);
-  res.json(rowsToObjects(result));
+  const users = db.users.map(u => ({ id: u.id, name: u.name, email: u.email, role: u.role, created_at: u.created_at }));
+  res.json(users);
 });
 
 router.get('/search', authenticate, (req, res) => {
   const db = getDB();
   const { email, name } = req.query;
-  let result;
-  if (email) {
-    result = db.exec(`SELECT id, name, email, role FROM users WHERE email LIKE ? LIMIT 10`, [`%${email}%`]);
-  } else if (name) {
-    result = db.exec(`SELECT id, name, email, role FROM users WHERE name LIKE ? LIMIT 10`, [`%${name}%`]);
-  } else {
-    result = db.exec(`SELECT id, name, email, role FROM users LIMIT 20`);
-  }
-  res.json(rowsToObjects(result));
+  let users = db.users;
+  if (email) users = users.filter(u => u.email.includes(email));
+  else if (name) users = users.filter(u => u.name.includes(name));
+  res.json(users.map(u => ({ id: u.id, name: u.name, email: u.email, role: u.role })));
 });
 
 router.put('/:id/role', authenticate, requireAdmin, (req, res) => {
@@ -38,8 +25,9 @@ router.put('/:id/role', authenticate, requireAdmin, (req, res) => {
     return res.status(400).json({ error: 'Invalid role' });
   }
   const db = getDB();
-  db.run(`UPDATE users SET role = ? WHERE id = ?`, [role, req.params.id]);
-  saveDB();
+  const user = db.users.find(u => u.id === req.params.id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  user.role = role;
   res.json({ message: 'Role updated' });
 });
 
@@ -48,10 +36,9 @@ router.delete('/:id', authenticate, requireAdmin, (req, res) => {
     return res.status(400).json({ error: 'Cannot delete yourself' });
   }
   const db = getDB();
-  db.run(`DELETE FROM project_members WHERE user_id = ?`, [req.params.id]);
-  db.run(`UPDATE tasks SET assignee_id = NULL WHERE assignee_id = ?`, [req.params.id]);
-  db.run(`DELETE FROM users WHERE id = ?`, [req.params.id]);
-  saveDB();
+  db.users = db.users.filter(u => u.id !== req.params.id);
+  db.project_members = db.project_members.filter(m => m.user_id !== req.params.id);
+  db.tasks = db.tasks.map(t => t.assignee_id === req.params.id ? { ...t, assignee_id: null } : t);
   res.json({ message: 'User deleted' });
 });
 
